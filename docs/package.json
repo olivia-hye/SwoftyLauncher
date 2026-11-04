@@ -1,0 +1,16 @@
+{
+  "name": "@f1modmanager/docs",
+  "version": "0.2.11",
+  "private": true,
+  "type": "module",
+  "description": "Documentation site for Swofty Launcher for F1 25",
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview",
+    "docs:reference": "node scripts/gen-reference.mjs"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.4"
+  }
+}

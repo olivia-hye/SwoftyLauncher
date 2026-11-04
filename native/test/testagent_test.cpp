@@ -1,0 +1,905 @@
+// Host test of the test agent's protocol and runner (src/core/testagent/agent_logic.hpp) and of the
+// SWOFTY_TEST coroutine runner (packages/sdk/include/swofty/test.hpp).
+#include "../src/core/testagent/agent_logic.hpp"
+
+#include <swofty/test.hpp>
+
+#include <cstdio>
+#include <map>
+
+namespace ta = testagent;
+
+static int fails;
+static void expect(bool ok, const char *what)
+{
+    printf("%s %s\n", ok ? "ok  :" : "FAIL:", what);
+    fails += !ok;
+}
+
+static bool has(const std::string &s, const char *part)
+{
+    return s.find(part) != std::string::npos;
+}
+
+struct FakeGame : ta::Game {
+    bool home = false;
+    std::vector<std::string> routes, log;
+    std::vector<ta::PadState> pads;
+    int capture_polls = 0;
+    std::string screen = "|fe_title||";
+    int test_steps = 0;
+
+    ta::Outcome hello() override { return ta::Outcome::ok("{\"v\":1}"); }
+    ta::Outcome route(const std::string &n) override
+    {
+        if (!home)
+            return ta::Outcome::unavailable("no home view model");
+        routes.push_back(n);
+        ++built;
+        return ta::Outcome::ok();
+    }
+    ta::Outcome skip(int d, int s) override { return ta::Outcome::ok("{\"d\":" + std::to_string(d) + ",\"s\":" + std::to_string(s) + "}"); }
+    ta::Outcome advance(int) override
+    {
+        if (!hq_vm)
+            return ta::Outcome::unavailable("no Team HQ view model");
+        ++advances;
+        return ta::Outcome::ok();
+    }
+    ta::Outcome ai_drives_player(bool on) override { return ta::Outcome::ok(on ? "1" : "0"); }
+    ta::Outcome read(const std::string &p) override
+    {
+        if (p == "car[0].chassis.mass")
+            return ta::Outcome::ok("{\"value\":798.5,\"type\":\"f32\"}");
+        return ta::Outcome::unavailable("no reader for " + p);
+    }
+    ta::Outcome set(const std::string &, const json::Value &v) override { return ta::Outcome::ok(ta::num(v.n)); }
+    ta::Outcome capture(const std::string &) override
+    {
+        capture_polls = 0;
+        return ta::Outcome::ok();
+    }
+    ta::Outcome capture_poll() override
+    {
+        return ++capture_polls < 3 ? ta::Outcome::pending() : ta::Outcome::ok("{\"file\":\"frames/x.png\"}");
+    }
+    ta::Outcome save_now() override { return ta::Outcome::unavailable("no save trigger"); }
+    int save_polls = 0, advance_polls = 0;
+    ta::Outcome save_poll() override { return ++save_polls < 3 ? ta::Outcome::pending() : ta::Outcome::ok("{\"writes\":2}"); }
+    ta::Outcome advance_poll() override
+    {
+        return ++advance_polls < 3 ? ta::Outcome::pending() : ta::Outcome::ok("{\"from_day\":10,\"to_day\":17}");
+    }
+    ta::Outcome quit() override { return ta::Outcome::ok(); }
+    ta::Outcome pad(const ta::PadState &p) override
+    {
+        pads.push_back(p);
+        a_presses += p.buttons == 0x1000;
+        return ta::Outcome::ok();
+    }
+    std::vector<std::string> tile_ids, selected;
+    int a_presses = 0, content_calls = 0;
+    bool content_ready = false, dlc = false;
+    std::string content_error;
+    bool home_ready() override { return home; }
+    uint64_t built = 0;
+    uint64_t tile_screens() override { return built; }
+    uint64_t screens = 0;
+    uint64_t screen_changes() override { return screens; }
+    ta::Outcome tile_select(const std::string &id) override
+    {
+        if (tile_ids.empty())
+            return ta::Outcome::unavailable("no tile screen");
+        for (auto &t : tile_ids)
+            if (t == id) {
+                selected.push_back(id);
+                return ta::Outcome::ok("{\"tile\":\"" + id + "\",\"route\":\"" + id + "\"}");
+            }
+        return ta::Outcome::fail("the current tile screen has no tile " + id);
+    }
+    ta::Outcome career_content() override
+    {
+        ++content_calls;
+        if (!content_ready)
+            return ta::Outcome::unavailable("the career content select screen has not built its tiles yet");
+        if (!content_error.empty())
+            return ta::Outcome::fail(content_error);
+        return ta::Outcome::ok("{\"content\":\"career_dlc_content\",\"route\":\"solo_career_continue_driver\"}");
+    }
+    std::string phase() override { return screen; }
+    ta::Outcome test_start(const std::string &fn) override
+    {
+        return fn == "t" ? ta::Outcome::ok() : ta::Outcome::unavailable("no test DLL registers " + fn);
+    }
+    ta::Outcome test_poll() override { return ++test_steps < 2 ? ta::Outcome::pending() : ta::Outcome::ok("{\"expects\":[]}"); }
+    uint64_t log_lines(uint64_t from, std::vector<std::string> &out) override
+    {
+        if (from == UINT64_MAX)
+            return log.size();
+        for (uint64_t i = from; i < log.size(); i++)
+            out.push_back(log[i]);
+        return log.size();
+    }
+
+    bool sandbox = false, title_bound = true, engaged = false, fe_career = false, resume = false, hq_vm = false;
+    int presses = 0, tiles = 0, cards = 0, advances = 0;
+    std::string tile_error, card_error, session_why = "the garage's go-to-track step is not found";
+    std::vector<std::string> notes;
+
+    ta::Outcome title_press() override
+    {
+        if (!title_bound)
+            return ta::Outcome::unavailable("the title's sync point is not bound on this build");
+        ++presses;
+        return ta::Outcome::ok();
+    }
+    std::string title_state() override { return engaged ? "engaged" : "waiting: the request has not called back"; }
+    ta::Outcome career_tile(const std::string &mode) override
+    {
+        if (!fe_career)
+            return ta::Outcome::unavailable("no fe_career view model yet");
+        ++tiles;
+        if (!tile_error.empty())
+            return ta::Outcome::fail(tile_error);
+        std::string m = mode == "driver_career" ? "driver" : "my_team";
+        return ta::Outcome::ok("{\"route\":\"" + (dlc ? "career_dlc_select_" + m : "solo_career_continue_" + m) + "\"}");
+    }
+    ta::Outcome resume_press(const std::string &slot) override
+    {
+        if (!resume)
+            return ta::Outcome::unavailable("the resume screen's cards are not filled yet");
+        ++cards;
+        if (!card_error.empty())
+            return ta::Outcome::fail(card_error);
+        return ta::Outcome::ok("{\"index\":0,\"slot\":" + (slot == "newest" ? std::string("3") : slot) + "}");
+    }
+    ta::Outcome session_start() override { return ta::Outcome::unavailable(session_why); }
+    std::vector<ta::SessionPlan> begun;
+    std::string begin_error, begin_missing;
+    ta::Outcome session_begin(const ta::SessionPlan &p) override
+    {
+        if (!begin_missing.empty())
+            return ta::Outcome::unavailable("session.start: needs " + begin_missing);
+        if (!begin_error.empty())
+            return ta::Outcome::fail(begin_error);
+        begun.push_back(p);
+        return ta::Outcome::ok("{\"filled\":" + std::to_string(ta::session_fill(p, {"f1_26", "entrant_setup_mode_8", "swofty_f1"}).size()) + "}");
+    }
+    bool sandboxed() override { return sandbox; }
+    void note(const std::string &l) override { notes.push_back(l); }
+};
+
+static std::vector<std::string> run(ta::Runner &r, uint64_t &now, int ticks, uint64_t step = 10)
+{
+    std::vector<std::string> out;
+    for (int i = 0; i < ticks; i++, now += step)
+        r.tick(now, out);
+    while (out.size() < 8)
+        out.push_back("");
+    return out;
+}
+
+static size_t answered(const std::vector<std::string> &out)
+{
+    size_t n = 0;
+    for (auto &l : out)
+        n += !l.empty();
+    return n;
+}
+
+static void submit(ta::Runner &r, const std::string &line)
+{
+    r.submit(ta::parse_command(line));
+}
+
+static void parsing()
+{
+    ta::Command c = ta::parse_command("{\"seq\":3,\"cmd\":\"route\",\"args\":{\"route\":\"career\"},\"timeout_ms\":500}");
+    expect(c.seq == 3 && c.cmd == "route" && c.args["route"].str() == "career" && c.timeout_ms == 500 && c.error.empty(),
+           "a command line parses");
+    expect(ta::parse_command("not json").error == "not a JSON object", "a broken line is an error");
+    expect(ta::parse_command("{\"cmd\":\"x\"}").error == "missing seq", "a line without seq is an error");
+    expect(ta::parse_command("{\"seq\":1,\"cmd\":\"wait\",\"timeout_ms\":999999999}").timeout_ms == ta::MAX_WAIT_MS,
+           "time limits are capped");
+    expect(ta::result_json(4, ta::Outcome::unavailable("no \"vm\""), 7) ==
+               "{\"seq\":4,\"status\":\"unavailable\",\"error\":\"no \\\"vm\\\"\",\"ms\":7}",
+           "a result line escapes its error");
+    ta::CarPath p;
+    std::string why;
+    expect(ta::parse_car_path("car[player].f1_aero.lift_scale", p, why) && p.player && p.system == "f1_aero" &&
+               p.field == "lift_scale",
+           "car[player].system.field parses");
+    expect(ta::parse_car_path("car[12].chassis.mass", p, why) && p.index == 12, "car[12] parses");
+    expect(!ta::parse_car_path("car[x].chassis.mass", p, why) && has(why, "0 to 25"), "a bad car index is refused");
+    uint16_t m;
+    expect(ta::button("a", m) && m == 0x1000 && ta::button("rt", m) && ta::pad_of(m).rt == 255 && !ta::button("mfd", m),
+           "buttons map to XInput masks");
+}
+
+static void runner()
+{
+    FakeGame g;
+    ta::Runner r(g);
+    uint64_t now = 1000;
+    g.engaged = true;
+    submit(r, "{\"seq\":1,\"cmd\":\"route\",\"args\":{\"route\":\"career\"},\"timeout_ms\":100}");
+    auto out = run(r, now, 12);
+    expect(answered(out) == 1 && has(out[0], "\"seq\":1,\"status\":\"timeout\"") &&
+               has(out[0], "route career: not within 0 s (no home view model: the home screen has not been built)"),
+           "route without a home view model waits for it and times out naming it, not a crash");
+    g.home = true;
+    submit(r, "{\"seq\":2,\"cmd\":\"route\",\"args\":{\"route\":\"career\"}}");
+    submit(r, "{\"seq\":3,\"cmd\":\"read\",\"args\":{\"path\":\"car[0].chassis.mass\"}}");
+    out = run(r, now, 2);
+    expect(answered(out) == 1 && has(out[0], "\"seq\":2,\"status\":\"ok\"") && g.routes.size() == 1,
+           "one command at a time: the route ran and answered once its screen was built");
+    out = run(r, now, 1);
+    expect(answered(out) == 1 && has(out[0], "\"value\":{\"value\":798.5"), "then the read answered with its value");
+    submit(r, "{\"seq\":4,\"cmd\":\"skip\",\"args\":{\"to\":\"session\"}}");
+    submit(r, "{\"seq\":5,\"cmd\":\"skip\",\"args\":{\"to\":\"sideways\"}}");
+    out = run(r, now, 2);
+    expect(has(out[0], "{\"d\":4,\"s\":15}"), "skip to session posts destination 4, the race by default");
+    expect(has(out[1], "\"status\":\"error\"") && has(out[1], "sideways"), "an unknown skip is an error");
+
+    submit(r, "{\"seq\":6,\"cmd\":\"wait\",\"args\":{\"event\":\"race.start\"},\"timeout_ms\":100}");
+    out = run(r, now, 3);
+    expect(!answered(out) && r.busy(), "a wait holds the runner while the event has not fired");
+    r.fires().fired("race.start");
+    out = run(r, now, 1);
+    expect(answered(out) == 1 && has(out[0], "\"seq\":6,\"status\":\"ok\"") && has(out[0], "\"fires\":1"),
+           "the wait answers on the fire");
+    submit(r, "{\"seq\":7,\"cmd\":\"wait\",\"args\":{\"event\":\"race.start\"},\"timeout_ms\":50}");
+    out = run(r, now, 10);
+    expect(answered(out) == 1 && has(out[0], "\"status\":\"timeout\""), "a second wait needs a second fire, and times out");
+    r.fires().fired("lap");
+    submit(r, "{\"seq\":8,\"cmd\":\"wait\",\"args\":{\"event\":\"lap\"}}");
+    out = run(r, now, 1);
+    expect(answered(out) == 1 && has(out[0], "\"status\":\"ok\""), "a fire before the wait counts");
+
+    submit(r, "{\"seq\":9,\"cmd\":\"pad\",\"args\":{\"press\":\"a\",\"then\":\"right\",\"ms\":30}}");
+    out = run(r, now, 20);
+    expect(answered(out) == 1 && has(out[0], "\"seq\":9,\"status\":\"ok\""), "a press and a then press finish");
+    expect(g.pads.size() == 4 && g.pads[0].buttons == 0x1000 && g.pads[1].buttons == 0 && g.pads[2].buttons == 0x0008 &&
+               g.pads[3].buttons == 0,
+           "the pad holds a, lets go, holds right, lets go");
+    submit(r, "{\"seq\":10,\"cmd\":\"pad\",\"args\":{\"press\":\"mfd_fuel\"}}");
+    out = run(r, now, 1);
+    expect(has(out[0], "unknown button 'mfd_fuel'"), "an unknown button is an error");
+
+    submit(r, "{\"seq\":11,\"cmd\":\"capture\",\"args\":{\"name\":\"team_hq\"}}");
+    out = run(r, now, 5);
+    expect(answered(out) == 1 && has(out[0], "frames/x.png"), "a capture answers once the frame is written");
+    submit(r, "{\"seq\":12,\"cmd\":\"capture\",\"args\":{\"name\":\"../x\"}}");
+    out = run(r, now, 1);
+    expect(has(out[0], "\"status\":\"error\""), "a capture name with a path is refused");
+
+    submit(r, "{\"seq\":13,\"cmd\":\"at\",\"args\":{\"phase\":\"home\"},\"timeout_ms\":1000}");
+    out = run(r, now, 2);
+    expect(!answered(out), "at waits for its screen");
+    g.screen = "|fe_home|StateFrontend|";
+    out = run(r, now, 1);
+    expect(answered(out) == 1 && has(out[0], "\"status\":\"ok\""), "at answers on fe_home for home");
+
+    g.log = {"[core] one"};
+    submit(r, "{\"seq\":14,\"cmd\":\"log\",\"args\":{\"pattern\":\"\\\\[rnd\\\\] blocked\"},\"timeout_ms\":1000}");
+    out = run(r, now, 2);
+    g.log.push_back("[rnd] blocked tab");
+    out = run(r, now, 1);
+    expect(answered(out) == 1 && has(out[0], "[rnd] blocked tab"), "a log wait matches a line written after it started");
+    submit(r, "{\"seq\":15,\"cmd\":\"log\",\"args\":{\"pattern\":\"(\"}}");
+    out = run(r, now, 1);
+    expect(has(out[0], "not a regular expression"), "a broken pattern is an error");
+
+    submit(r, "{\"seq\":16,\"cmd\":\"advance\",\"args\":{\"days\":7}}");
+    submit(r, "{\"seq\":17,\"cmd\":\"save\",\"args\":{\"what\":\"now\"}}");
+    submit(r, "{\"seq\":18,\"cmd\":\"run_test\",\"args\":{\"fn\":\"t\"}}");
+    submit(r, "{\"seq\":19,\"cmd\":\"run_test\",\"args\":{\"fn\":\"nope\"}}");
+    submit(r, "{\"seq\":20,\"cmd\":\"bogus\"}");
+    out = run(r, now, 8);
+    expect(answered(out) == 5, "every command answers");
+    expect(has(out[0], "\"status\":\"error\"") && has(out[0], "advance runs only in the save sandbox") &&
+               has(out[1], "save now runs only in the save sandbox"),
+           "advance and save now are refused outside the save sandbox");
+    expect(has(out[2], "\"seq\":18,\"status\":\"ok\""), "run_test answers when the test ends");
+    expect(has(out[3], "no test DLL registers nope"), "an unknown test function is unavailable");
+    expect(has(out[4], "unknown command 'bogus'"), "an unknown command is an error");
+}
+
+static void flow(ta::Runner &r, const char *name)
+{
+    r.fires().fired(std::string("flow:") + name);
+}
+
+static_assert(ta::CareerTimes{}.title == 90000 && ta::CareerTimes{}.title_pad_after == 3000,
+              "the title wait is 90 s, and the agent presses the virtual pad itself after 3 s");
+
+static ta::Runner &fast(ta::Runner &r)
+{
+    auto &t = r.career_times();
+    t.title = 400, t.route = 300, t.tile = 300, t.card = 300, t.team_hq = 600, t.advance = 300, t.hub = 600, t.session = 300;
+    t.retry = 50, t.title_pad_after = 100, t.pad_hold = 20, t.pad_gap = 30, t.notice_after = 100, t.route_settle = 200;
+    return r;
+}
+
+static void pad_timing()
+{
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        uint64_t now = 1000;
+        g.screens = 1;
+        std::vector<std::string> out;
+        r.tick(now, out);
+        submit(r, "{\"seq\":1,\"cmd\":\"pad\",\"args\":{\"press\":\"a\",\"ms\":30,\"settle_ms\":500}}");
+        auto o = run(r, now, 20);
+        expect(g.pads.empty() && answered(o) == 0, "a pad press waits while the screen has just changed");
+        o = run(r, now, 40);
+        expect(!g.pads.empty() && g.pads[0].buttons == 0x1000, "the press fires once the screen has settled");
+        expect(answered(o) == 1 && has(o[0], "\"status\":\"ok\""), "the press then finishes");
+        g.pads.clear();
+        g.screens = 2;
+        submit(r, "{\"seq\":2,\"cmd\":\"pad\",\"args\":{\"press\":\"a\",\"ms\":30,\"settle_ms\":500}}");
+        run(r, now, 20);
+        g.screens = 3;
+        run(r, now, 20);
+        expect(g.pads.empty(), "a screen that changes again restarts the settle time");
+        run(r, now, 80);
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        uint64_t now = 1000;
+        g.screens = 1;
+        submit(r, "{\"seq\":1,\"cmd\":\"pad\",\"args\":{\"press\":\"a\",\"ms\":30,\"settle_ms\":0,\"retry\":2,\"retry_after_ms\":200}}");
+        auto o = run(r, now, 100);
+        expect(g.a_presses == 3 && answered(o) == 1 && has(o[0], "\"status\":\"error\"") && has(o[0], "did not change after 3"),
+               "a pad that never changes the screen presses again twice, then fails");
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        uint64_t now = 1000;
+        g.screens = 1;
+        submit(r, "{\"seq\":1,\"cmd\":\"pad\",\"args\":{\"press\":\"a\",\"ms\":30,\"settle_ms\":0,\"retry\":3,\"retry_after_ms\":200}}");
+        auto o = run(r, now, 30);
+        g.screens = 2;
+        o = run(r, now, 30);
+        expect(g.a_presses == 2 && answered(o) == 1 && has(o[0], "\"screen_changed\":true"),
+               "a pad that changes the screen after one retry stops there");
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        uint64_t now = 1000;
+        g.screens = 1;
+        std::vector<std::string> out;
+        r.tick(now, out);
+        submit(r, "{\"seq\":1,\"cmd\":\"at\",\"args\":{\"phase\":\"track_select\",\"settle_ms\":300}}");
+        g.screen = "|track_select||";
+        auto o = run(r, now, 10);
+        expect(answered(o) == 0, "a screen wait with settle_ms waits for the screen to hold still");
+        o = run(r, now, 40);
+        expect(answered(o) == 1 && has(o[0], "\"status\":\"ok\""), "then it answers");
+    }
+}
+
+static void career()
+{
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"career\",\"args\":{\"op\":\"load\",\"slot\":\"newest\",\"at\":\"team_hq\"}}");
+        auto out = run(r, now, 1);
+        expect(has(out[0], "\"status\":\"error\"") && has(out[0], "career load runs only in the save sandbox"),
+               "career load is refused outside the save sandbox");
+        g.sandbox = true;
+        submit(r, "{\"seq\":2,\"cmd\":\"career\",\"args\":{\"slot\":\"x1\"}}");
+        submit(r, "{\"seq\":3,\"cmd\":\"career\",\"args\":{\"at\":\"pit_lane\"}}");
+        submit(r, "{\"seq\":4,\"cmd\":\"career\",\"args\":{\"mode\":\"grand_prix\"}}");
+        out = run(r, now, 3);
+        expect(has(out[0], "a career slot is a number or newest") && has(out[1], "team_hq, weekend_hub or session") &&
+                   has(out[2], "driver_career or my_team_career"),
+               "a bad slot, place or mode is an error");
+    }
+    {
+        FakeGame g;
+        g.sandbox = true;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"career\",\"args\":{\"slot\":3,\"at\":\"team_hq\",\"mode\":\"my_team_career\"}}");
+        auto out = run(r, now, 5);
+        expect(!answered(out) && g.presses >= 1, "at the title the load presses it without input and waits");
+        g.engaged = true;
+        out = run(r, now, 3);
+        expect(!answered(out) && g.routes.empty(), "then route career waits for the home view model");
+        g.home = true;
+        out = run(r, now, 6);
+        expect(g.routes.size() == 1 && g.routes[0] == "career" && g.tiles == 0, "route career fires once the home view model is there");
+        g.fe_career = true;
+        out = run(r, now, 6);
+        expect(g.tiles == 1 && g.cards == 0, "the career tile's action runs once fe_career is up");
+        g.resume = true;
+        out = run(r, now, 6);
+        expect(g.cards == 1 && !answered(out), "the resume card is pressed, then the load waits for Team HQ");
+        flow(r, "StateTeamHQ");
+        out = run(r, now, 1);
+        expect(answered(out) == 1 && has(out[0], "\"status\":\"ok\"") && has(out[0], "\"at\":\"team_hq\"") &&
+                   has(out[0], "\"slot\":\"3\"") && has(out[0], "\"card\":{\"index\":0"),
+               "StateTeamHQ answers the load");
+        expect(g.notes.size() == 1 && g.notes[0] == "[test] career ready at team_hq (slot 3)",
+               "the agent logs the line the CLI waits for");
+    }
+    {
+        FakeGame g;
+        g.sandbox = g.engaged = g.home = g.fe_career = g.resume = true;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        flow(r, "StateTeamHQ");
+        submit(r, "{\"seq\":1,\"cmd\":\"career\",\"args\":{\"at\":\"weekend_hub\"}}");
+        auto out = run(r, now, 4);
+        expect(!answered(out) && g.cards == 1, "a Team HQ entered before the press does not count");
+        flow(r, "StateTeamHQ");
+        out = run(r, now, 3);
+        expect(!answered(out) && g.advances == 0, "weekend_hub: the advance waits for Team HQ's advance view model");
+        g.hq_vm = true;
+        out = run(r, now, 3);
+        expect(g.advances == 1 && !answered(out), "then advances once and waits for the weekend");
+        flow(r, "StateSession");
+        out = run(r, now, 1);
+        expect(has(out[0], "\"status\":\"ok\"") && has(out[0], "\"at\":\"weekend_hub\"") &&
+                   g.notes.back() == "[test] career ready at weekend_hub (slot newest)",
+               "StateSession answers weekend_hub");
+    }
+    {
+        FakeGame g;
+        g.sandbox = g.engaged = g.home = g.fe_career = g.resume = g.hq_vm = true;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"career\",\"args\":{\"at\":\"session\"}}");
+        auto out = run(r, now, 3);
+        flow(r, "StateTeamHQ");
+        out = run(r, now, 3);
+        flow(r, "StateSession");
+        out = run(r, now, 2);
+        expect(has(out[0], "\"status\":\"unavailable\"") &&
+                   has(out[0], "career load at session: the garage's go-to-track step is not found"),
+               "at session answers unavailable with why");
+    }
+    struct Case {
+        const char *what, *step;
+        void (*set)(FakeGame &);
+    } cases[] = {
+        {"a title that never passes times out naming the press", "the title screen's press did not happen within 0 s",
+         [](FakeGame &) {}},
+        {"an unbound title falls back to the pad and says so", "press(es) of the virtual pad's a",
+         [](FakeGame &g) { g.title_bound = false; }},
+        {"no home view model times out naming route career", "route career from the main menu did not happen within 0 s (no home view model",
+         [](FakeGame &g) { g.engaged = true; }},
+        {"no fe_career times out naming the tile", "the career tile's continue action did not happen", [](FakeGame &g) { g.engaged = g.home = true; }},
+        {"no cards time out naming the resume card", "the resume card's press did not happen", [](FakeGame &g) { g.engaged = g.home = g.fe_career = true; }},
+        {"no Team HQ times out naming it", "the career loading into Team HQ (StateTeamHQ) did not happen",
+         [](FakeGame &g) { g.engaged = g.home = g.fe_career = g.resume = true; }},
+    };
+    for (auto &k : cases) {
+        FakeGame g;
+        g.sandbox = true;
+        k.set(g);
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"career\",\"args\":{}}");
+        auto out = run(r, now, 200);
+        expect(answered(out) == 1 && has(out[0], "\"status\":\"timeout\"") && has(out[0], k.step), k.what);
+    }
+    {
+        FakeGame g;
+        g.sandbox = g.engaged = g.home = g.fe_career = true;
+        g.tile_error = "the My Team tile has no saved career (its action routes to my_team_career)";
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"career\",\"args\":{}}");
+        auto out = run(r, now, 20);
+        expect(has(out[0], "\"status\":\"error\"") && has(out[0], "the career tile's continue action: the My Team tile has no saved"),
+               "a tile without a save fails at once with its step");
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"title\"}");
+        auto out = run(r, now, 3);
+        expect(!answered(out) && g.presses >= 1, "title presses without input and waits");
+        flow(r, "StateFrontend");
+        out = run(r, now, 1);
+        expect(has(out[0], "\"seq\":1,\"status\":\"ok\"") && g.notes.back() == "[test] title passed without input",
+               "the front end flow answers title");
+        expect(g.pads.empty(), "a title that passes within the grace gets no pad press");
+        g.title_bound = false;
+        ta::Runner r2(g);
+        submit(r2, "{\"seq\":2,\"cmd\":\"title\"}");
+        out = run(r2, now, 1);
+        expect(has(out[0], "\"status\":\"unavailable\"") && has(out[0], "not bound"),
+               "an unbound title answers unavailable, so the CLI falls back to the pad");
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"title\"}");
+        auto out = run(r, now, 9);
+        expect(!answered(out) && g.pads.empty(), "within the grace the title waits on its own press");
+        out = run(r, now, 30);
+        size_t downs = 0, ups = 0;
+        for (auto &p : g.pads)
+            (p.buttons == 0x1000 ? downs : ups) += 1;
+        expect(!answered(out) && downs >= 2 && ups >= 1 && downs - ups <= 1,
+               "past the grace the agent presses and releases the virtual pad's a");
+        g.engaged = true;
+        out = run(r, now, 1);
+        expect(has(out[0], "\"seq\":1,\"status\":\"ok\"") && has(out[0], "\"pad_presses\":") &&
+                   g.notes.back().rfind("[test] title passed after ", 0) == 0,
+               "the title answers ok with the number of pad presses");
+        expect(g.pads.back().buttons == 0, "the pad is let go once the title has passed");
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        fast(r);
+        r.career_times().title = 300;
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"title\"}");
+        auto out = run(r, now, 40);
+        expect(has(out[0], "\"status\":\"timeout\"") && has(out[0], "press(es) of the virtual pad's a") &&
+                   g.pads.back().buttons == 0,
+               "a title the pad can't pass times out saying how often it pressed, with the pad let go");
+    }
+}
+
+static void career_content_step()
+{
+    FakeGame g;
+    g.sandbox = g.engaged = g.home = g.fe_career = g.dlc = true;
+    ta::Runner r(g);
+    fast(r);
+    uint64_t now = 1000;
+    submit(r, "{\"seq\":1,\"cmd\":\"career\",\"args\":{\"mode\":\"driver_career\"}}");
+    auto out = run(r, now, 6);
+    expect(g.tiles == 1 && g.content_calls >= 1 && g.cards == 0 && !answered(out),
+           "a tile that opens the content select waits for its content tiles");
+    g.content_ready = g.resume = true;
+    out = run(r, now, 6);
+    expect(g.cards == 1, "the content tile that continues a career runs, then the resume card is pressed");
+    flow(r, "StateTeamHQ");
+    out = run(r, now, 2);
+    expect(has(out[0], "\"status\":\"ok\"") && has(out[0], "\"at\":\"team_hq\""), "and the load answers at Team HQ");
+
+    FakeGame h;
+    h.sandbox = h.engaged = h.home = h.fe_career = h.dlc = h.content_ready = true;
+    h.content_error = "no content tile continues a saved career (career_default_content routes to 'career_setup')";
+    ta::Runner r2(h);
+    fast(r2);
+    submit(r2, "{\"seq\":1,\"cmd\":\"career\",\"args\":{}}");
+    out = run(r2, now, 10);
+    expect(has(out[0], "\"status\":\"error\"") &&
+               has(out[0], "the content select's continue action: no content tile continues a saved career"),
+           "content without a saved career fails naming the step");
+}
+
+static void session_args()
+{
+    auto parse = [](const char *json_text, ta::SessionPlan &p) {
+        json::Value v;
+        json::parse(json_text, v);
+        return ta::parse_session(v, p);
+    };
+    ta::SessionPlan p;
+    expect(parse("{\"mode\":\"grand_prix\",\"track\":\"melbourne\"}", p).empty() && p.session_id == 15 &&
+               p.session_name == "race" && p.laps == 0 && p.ai_difficulty == -1,
+           "a Grand Prix defaults to the race");
+    expect(parse("{\"mode\":\"time_trial\"}", p).empty() && p.session_id == 18 && p.session_name == "time_trial",
+           "a Time Trial defaults to the time_trial session");
+    expect(parse("{\"mode\":\"grand_prix\",\"session\":\"practice2\"}", p).empty() && p.session_name == "practice_2",
+           "practice2 is the game's practice_2");
+    expect(parse("{\"mode\":\"grand_prix\",\"session\":\"qualifying_o\"}", p).empty() && p.session_id == 9,
+           "the game's own names are taken");
+    expect(has(parse("{\"mode\":\"race\"}", p), "time_trial\" or \"grand_prix"), "an unknown mode is refused");
+    expect(has(parse("{\"mode\":\"time_trial\",\"session\":\"race\"}", p), "a Time Trial has the session time_trial"),
+           "a Time Trial takes no other session");
+    expect(has(parse("{\"mode\":\"grand_prix\",\"session\":\"time_trial\"}", p), "no time_trial session"),
+           "a Grand Prix takes no time_trial session");
+    expect(has(parse("{\"mode\":\"grand_prix\",\"session\":\"warmup\"}", p), "not a session name"), "an unknown session is refused");
+    expect(has(parse("{\"mode\":\"grand_prix\",\"laps\":0}", p), "laps is 1 to 100"), "laps are 1 to 100");
+    expect(has(parse("{\"mode\":\"time_trial\",\"laps\":3}", p), "no laps setting"), "a Time Trial has no laps");
+    expect(has(parse("{\"mode\":\"grand_prix\",\"ai_difficulty\":111}", p), "0 to 110"), "AI difficulty is 0 to 110");
+    expect(has(parse("{\"mode\":\"grand_prix\",\"weather\":\"snow\"}", p), "clear, wet or rain"), "weather is checked");
+
+    parse("{\"mode\":\"grand_prix\",\"track\":\"melbourne\",\"session\":\"qualifying\",\"laps\":5,\"weather\":\"wet\"}", p);
+    ta::Fill f = ta::session_fill(p, {"f1_26", "entrant_setup_mode_8", "swofty_f1"});
+    expect(f.size() == 6 && f[0].first == "DevSessionDataContract.Game.setup_mode" && f[0].second == "f1_26" &&
+               f[2].first == "DevSessionDataContract.Entrants.entrant_list" && f[2].second == "swofty_f1" &&
+               f[3].first == "DevSessionDataContract.Track.name" && f[3].second == "melbourne" &&
+               f[4].second == "qualifying_1" && f[5].first == "DevSessionDataContract.Game.laps" && f[5].second == "5",
+           "the fill is the dev session's keys in the order it reads them");
+    expect(ta::session_fill(p, {}).size() == 3, "a box with no names leaves its keys out");
+    expect(ta::session_unfilled(p) == "weather", "weather has no dev session setting");
+}
+
+static void session_start_step()
+{
+    FakeGame g;
+    g.engaged = g.home = true;
+    ta::Runner r(g);
+    fast(r);
+    uint64_t now = 1000;
+    submit(r, "{\"seq\":1,\"cmd\":\"session.start\",\"args\":{\"mode\":\"grand_prix\",\"track\":\"melbourne\"}}");
+    auto out = run(r, now, 4);
+    expect(g.begun.size() == 1 && g.begun[0].track == "melbourne" && !answered(out),
+           "session.start fills the setup from the main menu, then waits for the load");
+    flow(r, "StateLoadSession");
+    out = run(r, now, 2);
+    expect(has(out[0], "\"status\":\"ok\"") && has(out[0], "\"event\":\"session.start\"") && has(out[0], "\"session\":\"race\""),
+           "and answers once the flow enters StateLoadSession");
+    expect(!g.notes.empty() && has(g.notes.back(), "[test] session.start grand_prix melbourne"), "the agent logs it");
+
+    FakeGame m;
+    m.engaged = m.home = true;
+    m.begin_missing = "Sess_DevSession_Apply";
+    ta::Runner r2(m);
+    fast(r2);
+    submit(r2, "{\"seq\":1,\"cmd\":\"session.start\",\"args\":{\"mode\":\"time_trial\"}}");
+    out = run(r2, now, 4);
+    expect(has(out[0], "\"status\":\"unavailable\"") && has(out[0], "needs Sess_DevSession_Apply"),
+           "a missing row answers unavailable naming it");
+
+    FakeGame e;
+    e.engaged = e.home = true;
+    e.begin_error = "melbourne can't run in cs_f1_2017: no 2017 world";
+    ta::Runner r3(e);
+    fast(r3);
+    submit(r3, "{\"seq\":1,\"cmd\":\"session.start\",\"args\":{\"mode\":\"grand_prix\"}}");
+    out = run(r3, now, 4);
+    expect(has(out[0], "\"status\":\"error\"") && has(out[0], "can't run in cs_f1_2017"), "a track the box can't run is refused");
+
+    FakeGame b;
+    ta::Runner r4(b);
+    fast(r4);
+    submit(r4, "{\"seq\":1,\"cmd\":\"session.start\",\"args\":{\"mode\":\"time_trial\",\"laps\":2}}");
+    out = run(r4, now, 2);
+    expect(has(out[0], "\"status\":\"error\"") && has(out[0], "no laps setting") && b.begun.empty(),
+           "bad arguments are refused before anything is asked of the game");
+
+    FakeGame t;
+    t.engaged = true;
+    ta::Runner r5(t);
+    fast(r5);
+    submit(r5, "{\"seq\":1,\"cmd\":\"session.start\",\"args\":{\"mode\":\"time_trial\"},\"timeout_ms\":200}");
+    out = run(r5, now, 60);
+    expect(has(out[0], "\"status\":\"timeout\"") && has(out[0], "main menu was not reached") && t.begun.empty(),
+           "without a home screen it waits for the main menu, then times out");
+}
+
+static void route_settles()
+{
+    FakeGame g;
+    g.engaged = g.home = true;
+    ta::Runner r(g);
+    fast(r);
+    uint64_t now = 1000;
+    submit(r, "{\"seq\":1,\"cmd\":\"route\",\"args\":{\"route\":\"f1_world\"}}");
+    auto out = run(r, now, 1);
+    g.built = 0;
+    out = run(r, now, 5);
+    expect(!answered(out), "a fired route waits for the screen it opens");
+    g.built = 1;
+    out = run(r, now, 1);
+    expect(has(out[0], "\"seq\":1,\"status\":\"ok\""), "and answers once a tile screen is built");
+    submit(r, "{\"seq\":2,\"cmd\":\"route\",\"args\":{\"route\":\"play\"}}");
+    out = run(r, now, 1);
+    g.built = 1;
+    out = run(r, now, 30);
+    expect(has(out[0], "\"seq\":2,\"status\":\"ok\""), "a route to a screen that is no tile list answers after route_settle");
+}
+
+static void home_and_tiles()
+{
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"route\",\"args\":{\"route\":\"f1_world\"},\"timeout_ms\":5000}");
+        auto out = run(r, now, 5);
+        expect(!answered(out) && g.routes.empty() && g.presses >= 1, "route from boot passes the title first");
+        flow(r, "StateFrontend");
+        g.screen = "|frontend_transition|#5f9ae18b|";
+        size_t before = g.pads.size();
+        out = run(r, now, 5);
+        expect(!answered(out) && g.pads.size() == before, "on the transition screen the notice gets no press at first");
+        out = run(r, now, 60);
+        expect(!answered(out) && g.a_presses >= 1, "past notice_after the virtual pad's a answers the notice");
+        g.home = true;
+        g.screen = "|fe_home|#957880c6|";
+        out = run(r, now, 2);
+        expect(answered(out) == 1 && has(out[0], "\"seq\":1,\"status\":\"ok\"") && g.routes.size() == 1 &&
+                   g.routes[0] == "f1_world" && g.pads.back().buttons == 0,
+               "once the home view model is there the route fires and the pad is let go");
+        submit(r, "{\"seq\":2,\"cmd\":\"home\"}");
+        out = run(r, now, 1);
+        expect(has(out[0], "\"seq\":2,\"status\":\"ok\",\"value\":{\"home\":true}"), "home answers at once on the main menu");
+    }
+    {
+        FakeGame g;
+        g.engaged = true;
+        g.screen = "|fe_title||";
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"home\",\"timeout_ms\":200}");
+        auto out = run(r, now, 30);
+        expect(has(out[0], "\"status\":\"timeout\"") && has(out[0], "home: not within") && g.pads.empty(),
+               "away from the transition screen home presses nothing and times out");
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"tile\",\"args\":{\"tile\":\"career\"},\"timeout_ms\":5000}");
+        auto out = run(r, now, 5);
+        expect(!answered(out) && g.selected.empty(), "tile waits while there is no tile screen");
+        g.tile_ids = {"story", "career", "mod_menu", "f1_world"};
+        out = run(r, now, 1);
+        expect(has(out[0], "\"status\":\"ok\"") && has(out[0], "\"route\":\"career\"") && g.selected.size() == 1 &&
+                   g.pads.empty(),
+               "then runs the tile's action without the pad");
+        submit(r, "{\"seq\":2,\"cmd\":\"tile\",\"args\":{\"tile\":\"braking_point\"}}");
+        out = run(r, now, 1);
+        expect(has(out[0], "\"status\":\"error\"") && has(out[0], "no tile braking_point"), "an unknown tile is an error");
+        submit(r, "{\"seq\":3,\"cmd\":\"tile\",\"args\":{}}");
+        out = run(r, now, 1);
+        expect(has(out[0], "tile needs"), "tile needs an id");
+    }
+    {
+        FakeGame g;
+        ta::Runner r(g);
+        fast(r);
+        uint64_t now = 1000;
+        submit(r, "{\"seq\":1,\"cmd\":\"tile\",\"args\":{\"tile\":\"time_trial\"},\"timeout_ms\":100}");
+        auto out = run(r, now, 20);
+        expect(has(out[0], "\"status\":\"timeout\"") && has(out[0], "no tile screen"), "no tile screen times out naming it");
+    }
+}
+
+static void sandboxed_ops()
+{
+    FakeGame g;
+    g.sandbox = true;
+    ta::Runner r(g);
+    uint64_t now = 1000;
+    submit(r, "{\"seq\":1,\"cmd\":\"advance\",\"args\":{\"days\":7}}");
+    auto out = run(r, now, 2);
+    expect(has(out[0], "\"status\":\"unavailable\"") && has(out[0], "no Team HQ view model"),
+           "in the sandbox, advance without Team HQ answers unavailable");
+    g.hq_vm = true;
+    submit(r, "{\"seq\":2,\"cmd\":\"advance\",\"args\":{\"days\":7}}");
+    out = run(r, now, 2);
+    expect(!answered(out) && g.advances == 1, "advance presses once and waits for the advance to stop");
+    out = run(r, now, 3);
+    expect(answered(out) == 1 && has(out[0], "\"to_day\":17"), "then answers with the days");
+    submit(r, "{\"seq\":3,\"cmd\":\"save\",\"args\":{\"what\":\"now\"}}");
+    out = run(r, now, 3);
+    expect(has(out[0], "\"status\":\"unavailable\"") && has(out[0], "no save trigger"), "an unbound save now answers unavailable");
+}
+
+// The coroutine runner: a fake host answers the test's ops.
+SWOFTY_TEST(waits_and_checks)(swofty::test::Context &t) -> swofty::test::Task
+{
+    bool at = co_await t.at("team_hq", 60);
+    t.expect(at, "reached team_hq");
+    t.expect(t.read<double>("car[0].chassis.mass") > 790, "the car is heavy enough");
+    t.expect(t.read<bool>("ui.tab.visible") == false, "the tab is hidden");
+    co_await t.route("laptop_rnd");
+    t.log_text("routed");
+}
+
+SWOFTY_TEST(a_failing_op)(swofty::test::Context &t) -> swofty::test::Task
+{
+    bool ok = co_await t.log("never", 1);
+    t.expect(!ok, "the log wait failed");
+}
+
+SWOFTY_TESTS()
+
+struct Host {
+    std::map<uint64_t, int> answers;
+    std::vector<std::string> started, expects, logs;
+    int polls = 0;
+    int fail_ops = 0;
+};
+
+static void coroutines()
+{
+    Host h;
+    SwoftyTestHost host{sizeof(SwoftyTestHost), SWOFTY_TEST_HOST_VERSION, &h,
+                        [](void *s, const char *line) -> uint64_t {
+                            auto *h = static_cast<Host *>(s);
+                            h->started.push_back(line);
+                            return h->started.size();
+                        },
+                        [](void *s, uint64_t op, char *out, size_t cap) -> int {
+                            auto *h = static_cast<Host *>(s);
+                            if (++h->polls % 2)
+                                return 0;
+                            snprintf(out, cap, "{\"seq\":%llu}", (unsigned long long)op);
+                            return h->fail_ops ? 2 : 1;
+                        },
+                        [](void *s, int ok, const char *what) {
+                            static_cast<Host *>(s)->expects.push_back(std::string(ok ? "+" : "-") + what);
+                        },
+                        [](void *s, const char *text) { static_cast<Host *>(s)->logs.push_back(text); },
+                        [](void *, const char *path, char *out, size_t cap) -> int {
+                            if (!std::strcmp(path, "car[0].chassis.mass"))
+                                snprintf(out, cap, "{\"value\":798.5,\"type\":\"f32\"}");
+                            else if (!std::strcmp(path, "ui.tab.visible"))
+                                snprintf(out, cap, "{\"value\":false,\"type\":\"bool\"}");
+                            else {
+                                snprintf(out, cap, "no reader");
+                                return 0;
+                            }
+                            return 1;
+                        }};
+    expect(std::string(SwoftyTestNames()) == "waits_and_checks\na_failing_op\n", "SWOFTY_TESTS lists both tests");
+    expect(SwoftyTestStart("nope", &host) == nullptr, "an unknown test does not start");
+    void *run = SwoftyTestStart("waits_and_checks", &host);
+    int r = 0, steps = 0;
+    while ((r = SwoftyTestStep(run)) == 0 && steps < 50)
+        steps++;
+    SwoftyTestEnd(run);
+    expect(r == 1, "the test passes once its ops answer");
+    expect(h.started.size() == 2 && has(h.started[0], "\"cmd\":\"at\"") && has(h.started[0], "\"timeout_ms\":60000") &&
+               has(h.started[1], "\"route\":\"laptop_rnd\""),
+           "each co_await started its agent command");
+    expect(h.expects.size() == 3 && h.expects[0] == "+reached team_hq" && h.expects[1] == "+the car is heavy enough" &&
+               h.expects[2] == "+the tab is hidden",
+           "expectations reached the host in order");
+    expect(h.logs.size() == 1 && h.logs[0] == "routed", "t.log_text reached the host");
+    expect(steps >= 4, "the test waited across steps instead of blocking");
+
+    Host f;
+    f.fail_ops = 1;
+    host.self = &f;
+    run = SwoftyTestStart("a_failing_op", &host);
+    steps = 0;
+    while ((r = SwoftyTestStep(run)) == 0 && steps < 50)
+        steps++;
+    SwoftyTestEnd(run);
+    expect(r == 2, "a failed op fails the test");
+    expect(f.expects.size() == 2 && f.expects[0][0] == '-' && has(f.expects[0], "\"cmd\":\"log\"") &&
+               f.expects[1] == "+the log wait failed",
+           "the failed op is a failed expectation, and the test went on");
+}
+
+int main()
+{
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    career();
+    pad_timing();
+    home_and_tiles();
+    route_settles();
+    session_args();
+    session_start_step();
+    career_content_step();
+    sandboxed_ops();
+    parsing();
+    runner();
+    coroutines();
+    printf("%s (%d failure(s))\n", fails ? "SOME FAILED" : "ALL PASSED", fails);
+    return fails ? 1 : 0;
+}

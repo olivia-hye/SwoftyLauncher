@@ -1,0 +1,82 @@
+---
+title: Restoring the game
+description: How the game folder rolls back after every session, and when to run swofty restore to put every game file back to stock.
+---
+
+# Restoring the game
+
+Every session puts the game folder back to vanilla when the game exits, whether it quits, crashes or is stopped. You don't need to do anything after you play. Use restore for the cases below:
+
+| When | What to do |
+|---|---|
+| A launch stops because a file is in the way | [Files in the way](#files-in-the-way) |
+| You ran `swofty apply`, which leaves the profile installed | [Restore](#restore) |
+| The game updated and its files need repair | [After a game update](#after-a-game-update) |
+| You're about to uninstall | [Restore](#restore), then [Uninstalling](/guide/uninstall) |
+
+## Restore
+
+1. Close F1 25.
+2. Run:
+
+   ```sh
+   swofty restore
+   ```
+
+3. Read the report. If anything couldn't be restored, resolve those issues before you play vanilla.
+
+Restore puts back the backed-up files and removes what the launcher added.
+
+## After a crash
+
+If the launcher itself was stopped before the session finished, the next launch, `swofty run`, `swofty apply` or launcher start puts the folder back first and says **Recovered the game folder from an unfinished session**. Use `swofty verify` to check for remaining changes, or `swofty doctor` if you want to check your whole setup.
+
+## Files in the way
+
+When a file the profile needs to place is already in the game folder and the launcher can't prove it put it there (for example, a mod you copied in by hand), it leaves the file alone and doesn't start the game. The launcher opens a **Your game files have been edited** modal; **What to do** on the play bar reopens it.
+
+1. Read the list of files in the modal.
+2. Select **Restore game folder**. From a terminal, run `swofty restore` instead.
+3. Press **Play** again.
+
+Either way, restore rolls back the launcher's changes and moves those files to `$DATA/set-aside/<time>/`, where you can get them back.
+
+## After a game update
+
+The launcher won't put files from an old game build back over a newer one. If your game files still need repair:
+
+1. In Steam, open F1 25 → **Properties** → **Installed Files** → **Verify integrity of game files**.
+2. Run `swofty restore` again to remove the launcher's additions (`version.dll` and `swofty/`). Steam repairs game files but leaves those additions in place.
+
+## Backups
+
+Your [data folder](/guide/installation#where-your-files-are-stored) holds the original files needed to undo changes, so keep it until restoration is complete.
+
+## Launcher saves
+
+Each profile plays on its own copy of the profile save, kept in your data folder. Steam's save stays as it is, so starting F1 25 from Steam shows your normal careers. The first time the launcher starts after updating to 1.7.0, it copies your current Steam save into every profile; after that the two saves are independent, and launcher saves don't sync between PCs. **Use launcher saves** in the menu beside Play turns it off for a profile, and **Play once with your Steam saves** runs a single session on the Steam save. `swofty saves import` and `swofty saves export --to steam` copy between them. [Launcher saves](/reference/saves#launcher-saves) has the folders and the details.
+
+## Restoring a profile save
+
+The launcher keeps copies of your profile save in the [career vault](/reference/saves): at launcher start, before and after every Play, and when F1 25 was started from Steam or the EA app. When the save changed outside the launcher and got smaller, or got smaller in a session without an addon that affects saves, the Addons page offers **Restore**, and the [Saves](/using/career-saves) page lists every copy with the careers in it. `swofty saves list` lists every copy and `swofty saves restore <snapshot>` puts one back.
+
+A restore waits until F1 25 and Steam are closed (the EA app, for the EA app copy). Exit Steam completely (Steam menu > Exit) first, restore, then start Steam, which uploads the restored save. If Steam asks which copy to keep, keep the local files (this computer).
+
+Each restore first copies the save it replaces into the vault, as a `before a restore` snapshot.
+
+Before playing from Steam, `swofty saves backup` keeps a copy that is never pruned.
+
+### After a restore made the game report a corrupted save
+
+If F1 25 showed the corrupted save prompt after a restore and you accepted recovery, the game reset the profile. To get the old profile back:
+
+1. Close F1 25, then exit Steam completely (Steam menu > Exit).
+2. Run `swofty saves list`. Pick the snapshot taken before the restore: the one marked `before a restore`, or an earlier one.
+3. Run `swofty saves restore <that snapshot>`.
+4. Start Steam. If it asks which copy to keep, choose the local files (this computer).
+5. Start F1 25.
+
+## Next
+
+- [Uninstalling](/guide/uninstall): remove the launcher.
+- [Backups and recovery](/reference/restore): how restoration works, for contributors.

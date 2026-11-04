@@ -1,0 +1,296 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build, for example v0.2.0
+        required: true
+      dry-run:
+        description: Build and package without publishing; the archives stay on the run as the linux and windows artefacts
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  native:
+    name: Native loader
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      # The native scripts pin their compilers to the maintainer's healthy cores (taskset -c 2-7,...),
+      # which leaves two of a hosted runner's four. This shim drops the pin and runs the command as is.
+      - name: Use every runner core
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat > "$RUNNER_TEMP/bin/taskset" <<'EOF'
+          #!/bin/sh
+          [ "$1" = -c ] && shift 2
+          exec "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/bin/taskset"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # A fixed install path, so the objects in CI's Zig cache match (see ci.yml).
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+          use-tool-cache: true
+
+      # CI on main saves this cache; a tag can read main's caches but its own are of no use to the next tag.
+      - name: Zig cache period
+        id: zig-period
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Zig cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            native/build/zig-cache
+          key: zig-${{ runner.os }}-0.16.0-${{ steps.zig-period.outputs.month }}-${{ hashFiles('native/**', 'addons/*/native/**', 'packages/sdk/include/**') }}
+          restore-keys: zig-${{ runner.os }}-0.16.0-${{ steps.zig-period.outputs.month }}-
+
+      - name: Build
+        run: native/build.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native
+          path: |
+            native/dist/
+
+  # The binaries come from main's CI run for the tagged commit (release-binaries.yml, called by ci.yml), which
+  # the maintainer waits for before tagging: this job waits for that run while it is still going and takes its
+  # binaries when it passed. Without such a run it leaves the run id empty, and the binaries job builds them.
+  ci-binaries:
+    name: Main CI binaries
+    runs-on: ubuntu-latest
+    outputs:
+      run-id: ${{ steps.find.outputs.run-id }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha=$(gh api "repos/$REPO/commits/$TAG" --jq .sha) || exit 0
+          for _ in $(seq 40); do
+            run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&branch=main&per_page=1" \
+              --jq '.workflow_runs[0] // empty | "\(.id) \(.status) \(.conclusion)"') || exit 0
+            read -r id status conclusion <<< "$run"
+            if [ -z "$id" ]; then echo "no CI run on main for $sha; building"; exit 0; fi
+            if [ "$status" = completed ]; then break; fi
+            echo "CI run $id for $sha is $status; waiting"
+            sleep 30
+          done
+          if [ "$status" != completed ] || [ "$conclusion" != success ]; then
+            echo "CI run $id for $sha is $status ($conclusion); building"; exit 0
+          fi
+          have=$(gh api "repos/$REPO/actions/runs/$id/artifacts?per_page=100" --jq \
+            '[.artifacts[] | select(.expired | not) | .name] | (index("linux-binaries") != null and index("windows-binaries") != null)') || exit 0
+          if [ "$have" != true ]; then echo "CI run $id has no release binaries; building"; exit 0; fi
+          echo "taking the binaries from CI run $id"
+          echo "run-id=$id" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: Release binaries
+    needs: ci-binaries
+    if: needs.ci-binaries.outputs.run-id == ''
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      ref: ${{ inputs.tag || github.ref_name }}
+
+  # The packaging job per system joins the native loader and that system's binaries.
+  linux:
+    name: Linux
+    needs: [native, ci-binaries, binaries]
+    if: ${{ !cancelled() && needs.native.result == 'success' && (needs.ci-binaries.outputs.run-id != '' || needs.binaries.result == 'success') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-binaries
+          run-id: ${{ needs.ci-binaries.outputs.run-id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Unbundle the binaries
+        run: tar xf linux-binaries.tar && rm linux-binaries.tar
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: native
+          path: native/dist
+
+      - name: Fetch dxc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/dxc/fetch.sh dxc-linux-x86_64.tar.gz
+
+      - name: Package
+        run: |
+          out="swofty-launcher-$TAG-linux-x86_64"
+          mkdir -p "$out/bin" "$out/loader" "$out/share/applications" "$out/share/icons/hicolor/256x256/apps" "$out/share/icons/hicolor/512x512/apps" "$out/share/icons/hicolor/scalable/apps"
+          cp target/release/swofty target/release/swofty-launcher dist/swofty-ui/swofty-ui "$out/bin/"
+          cp -r native/dist/. "$out/loader/"
+          if [ -d dxc ]; then cp -r dxc "$out/dxc"; fi
+          cp apps/launcher/assets/net.swofty.ModLauncher.desktop tools/swofty-ui/res/net.swofty.SwoftyUI.desktop "$out/share/applications/"
+          cp apps/launcher/assets/icon-256.png "$out/share/icons/hicolor/256x256/apps/net.swofty.ModLauncher.png"
+          cp apps/launcher/assets/icon-512.png "$out/share/icons/hicolor/512x512/apps/net.swofty.ModLauncher.png"
+          cp apps/launcher/assets/icon.svg "$out/share/icons/hicolor/scalable/apps/net.swofty.ModLauncher.svg"
+          cp tools/swofty-ui/res/icon-256.png "$out/share/icons/hicolor/256x256/apps/net.swofty.SwoftyUI.png"
+          cp tools/swofty-ui/res/icon-512.png "$out/share/icons/hicolor/512x512/apps/net.swofty.SwoftyUI.png"
+          cp LICENSE README.md THIRD_PARTY.md "$out/"
+          tar czf "$out.tar.gz" "$out"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: swofty-launcher-*.tar.gz
+
+  windows:
+    name: Windows
+    needs: [native, ci-binaries, binaries]
+    if: ${{ !cancelled() && needs.native.result == 'success' && (needs.ci-binaries.outputs.run-id != '' || needs.binaries.result == 'success') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-binaries
+          run-id: ${{ needs.ci-binaries.outputs.run-id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: native
+          path: native/dist
+
+      - name: Fetch dxc
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/dxc/fetch.sh dxc-windows-x86_64.tar.gz
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "swofty-launcher-$env:TAG-windows-x86_64"
+          New-Item -ItemType Directory -Force "$out/bin", "$out/loader" | Out-Null
+          Copy-Item target/release/swofty.exe, target/release/swofty-launcher.exe, dist/swofty-ui/swofty-ui.exe "$out/bin/"
+          Copy-Item -Recurse native/dist/* "$out/loader/"
+          if (Test-Path dxc) { Copy-Item -Recurse dxc "$out/dxc" }
+          Copy-Item LICENSE, README.md, THIRD_PARTY.md "$out/"
+          Compress-Archive -Path $out -DestinationPath "$out.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: swofty-launcher-*.zip
+
+  # The release gate (docs/std/compatibility.md#the-release-gate): the standard library's schemas against the previous
+  # release, then the compatibility suite in tools/compat, which builds and starts every Addon Browser addon version
+  # on the 1.5 core and on this one. Publishing waits for it.
+  gate:
+    name: Release gate
+    needs: [linux]
+    if: ${{ !cancelled() && needs.linux.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - name: Schema versions against the previous release
+        run: python3 tools/std/schemacheck.py --released-before "$(git rev-parse "$TAG^{commit}")^"
+
+      - name: Registry examples and must-fail cases
+        run: python3 tools/std/validate.py
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux
+          path: artefacts
+
+      # tools/compat/README.md: the gate builds every Addon Browser addon version with the 1.5 release (A) and this
+      # release (B) and needs a game folder and a baseline, which hosted runners don't have. A runner that has them
+      # names them in the repository variables; anywhere else the step is a notice. Exit 1 is a difference, 2 a tool
+      # error such as too little disk space; both fail the release.
+      - name: Compatibility gate
+        env:
+          GAME: ${{ vars.COMPAT_GAME_DIR }}
+          CLI_A: ${{ vars.COMPAT_REFERENCE_CLI }}
+          LOADER_A: ${{ vars.COMPAT_REFERENCE_LOADER }}
+          BASELINE: ${{ vars.COMPAT_BASELINE_DIR }}
+          CACHE: ${{ vars.COMPAT_CACHE_DIR }}
+        run: |
+          if [ ! -f tools/compat/run.sh ]; then
+            echo "::notice::tools/compat/run.sh is not in $TAG; the compatibility gate has nothing to run"
+            exit 0
+          fi
+          if [ -z "$GAME" ] || [ ! -f "$GAME/F1_25.exe" ] || [ -z "$CLI_A" ] || [ ! -x "$CLI_A" ]; then
+            echo "::notice::the compatibility gate needs F1 25 and the 1.5 swofty binary (vars.COMPAT_GAME_DIR, vars.COMPAT_REFERENCE_CLI), which this runner doesn't have; run tools/compat/run.sh run on a machine with the game before tagging"
+            exit 0
+          fi
+          tar xzf "artefacts/swofty-launcher-$TAG-linux-x86_64.tar.gz" -C "$RUNNER_TEMP"
+          b="$RUNNER_TEMP/swofty-launcher-$TAG-linux-x86_64"
+          set -- --cli-a "$CLI_A" --cli-b "$b/bin/swofty" --loader-b "$b/loader" --game "$GAME" \
+            --allow buildhash --allow loader
+          if [ -n "$LOADER_A" ]; then set -- "$@" --loader-a "$LOADER_A"; fi
+          if [ -n "$BASELINE" ]; then set -- "$@" --baseline-from "$BASELINE"; fi
+          if [ -n "$CACHE" ]; then set -- "$@" --cache "$CACHE"; fi
+          status=0
+          tools/compat/run.sh run "$@" || status=$?
+          case $status in
+            0) ;;
+            1) echo "::error::the compatibility gate found addons that build differently on $TAG; see its summary.txt" ;;
+            *) echo "::error::the compatibility gate could not run (exit $status: a download, a binary, a timeout or the disk)" ;;
+          esac
+          exit $status
+
+  publish:
+    name: Publish the release
+    needs: [linux, windows, gate]
+    if: ${{ !cancelled() && !inputs.dry-run && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux
+          path: artefacts
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows
+          path: artefacts
+
+      - name: Checksums
+        working-directory: artefacts
+        run: sha256sum swofty-launcher-* > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            artefacts/swofty-launcher-*
+            artefacts/SHA256SUMS
