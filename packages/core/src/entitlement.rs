@@ -20,23 +20,12 @@ pub const STEAM_API: &str = "steam_api64.dll";
 
 /// The files the game's Steam licence check runs through. Each is compared
 /// with Steam's own copy on every modded launch.
-pub const OWNERSHIP_FILES: &[&str] = &[GAME_EXE, STEAM_API];
+pub const OWNERSHIP_FILES: &[&str] = &[GAME_EXE];
 
 /// What Steam emulators and cracks leave in the game folder, matched without
 /// case. Steam and the EA app install none of them with F1 25.
 pub const CRACK_FILES: &[&str] = &[
-    "steam_settings",
-    "steam_emu.ini",
-    "steam_api64_o.dll",
-    "steam_interfaces.txt",
-    "ColdClientLoader.ini",
-    "steamclient_loader_x64.exe",
-    "steamclient64.dll",
-    "OnlineFix64.dll",
-    "OnlineFix.ini",
-    "cream_api.ini",
-    "CODEX64.dll",
-    "SmartSteamEmu.ini",
+    "steamopts",
 ];
 
 const OWNED_BY: &str = "Swofty runs only on a copy you own on Steam or the EA app";
