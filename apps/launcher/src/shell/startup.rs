@@ -72,6 +72,7 @@ impl Shell {
         let developer_mode = config.developer;
         let clear_old_session_logs = config.clear_old_session_logs;
         let update_check = config.updates.check;
+        let importer_check = config.updates.importer;
         Self::guard_close(window, cx);
         Self::recover_in_background(&store, clear_old_session_logs, cx);
         let poll = Self::poll_game(window, cx);
@@ -144,6 +145,7 @@ impl Shell {
             reload_generation: 0,
             slow_logged: false,
             update_check,
+            importer_check,
             updates: crate::update::Updates::new(),
             blocks: crate::blocks::Blocks::default(),
             content_width: 900.,

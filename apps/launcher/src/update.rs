@@ -157,10 +157,10 @@ impl Shell {
 
     fn tick_updates(&mut self, cx: &mut Context<Self>) {
         let now = update::now_secs();
-        let check_updates = self.store.config().updates.check;
+        let config = self.store.config();
         let u = &self.updates;
-        let addon_due = check_updates && u.addon.probe_due(now);
-        let launcher_due = check_updates && u.launcher.probe_due(now);
+        let addon_due = config.updates.importer && u.addon.probe_due(now);
+        let launcher_due = config.updates.check && u.launcher.probe_due(now);
         if u.checking
             || matches!(u.phase, Phase::Installing | Phase::Restarting)
             || !(addon_due || launcher_due)
@@ -622,7 +622,7 @@ impl Shell {
     }
 
     pub(crate) fn update_bar(&self, p: Palette) -> Option<impl IntoElement> {
-        if !self.update_check {
+        if !self.update_check && !self.importer_check {
             return None;
         }
         let bar = h_flex()

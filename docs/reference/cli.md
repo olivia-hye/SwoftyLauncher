@@ -308,6 +308,7 @@ The launcher's update check reads `"updates"` in `$DATA/config.json`:
 | Key | Purpose |
 |---|---|
 | `check` | `false` turns off the launcher's check for new launcher releases; `swofty update` still works and Simplified for Swofty is still kept up to date. The default is `true` |
+| `importer` | `false` turns off the Simplified Importer's check for new Simplified for Swofty releases, while the launcher check stays as `check` says. The default is `true` |
 
 Older configs may still hold `skip`, `checked_at` and `latest` under `"updates"`, and `checked_at` under `"managed"`. The launcher ignores them and drops them the next time it saves the config.
 

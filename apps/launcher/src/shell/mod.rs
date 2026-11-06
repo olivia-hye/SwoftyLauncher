@@ -98,6 +98,8 @@ pub struct Shell {
     slow_logged: bool,
     /// `updates.check` from config.json, read when the library loads.
     pub(crate) update_check: bool,
+    /// `updates.importer` from config.json: the Simplified Importer's addon check.
+    pub(crate) importer_check: bool,
     pub(crate) updates: crate::update::Updates,
     pub(crate) blocks: crate::blocks::Blocks,
     pub(crate) content_width: f32,
