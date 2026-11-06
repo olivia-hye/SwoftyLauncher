@@ -170,6 +170,8 @@ pub struct Shell {
     slow_logged: bool,
     /// `updates.check` from config.json, read when the library loads.
     pub(crate) update_check: bool,
+    /// `updates.importer` from config.json: the Simplified Importer's addon check.
+    pub(crate) importer_check: bool,
     pub(crate) updates: crate::update::Updates,
     pub(crate) forms: HashMap<String, crate::blocks::FormSlot>,
     pub(crate) searches: HashMap<String, crate::blocks::SearchSlot>,
@@ -430,6 +432,7 @@ impl Shell {
         let developer_mode = config.developer;
         let clear_old_session_logs = config.clear_old_session_logs;
         let update_check = config.updates.check;
+        let importer_check = config.updates.importer;
         let shell = cx.entity().downgrade();
         let confirming = Rc::new(std::cell::Cell::new(false));
         window.on_window_should_close(cx, move |window, cx| {
@@ -629,6 +632,7 @@ impl Shell {
             reload_generation: 0,
             slow_logged: false,
             update_check,
+            importer_check,
             updates: crate::update::Updates::new(),
             forms: HashMap::new(),
             searches: HashMap::new(),
@@ -998,6 +1002,7 @@ impl Shell {
         self.vr_profiles = config.vr_profiles;
         self.start_store = config.launch.start_store;
         self.update_check = config.updates.check;
+        self.importer_check = config.updates.importer;
         if matches!(self.page, Page::Section(i) if i >= self.library.sections.len()) {
             self.page = Page::Addons;
         }

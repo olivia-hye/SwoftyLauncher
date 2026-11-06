@@ -23,8 +23,12 @@ const SWEPT_DIRS: [&str; 3] = ["loader", "addons", crate::postfx::DXC_DIR];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UpdateConfig {
+    /// Launcher releases: check for them and offer the new launcher.
     #[serde(default = "yes")]
     pub check: bool,
+    /// The Simplified Importer addon: check its releases and offer the update.
+    #[serde(default = "yes")]
+    pub importer: bool,
 }
 
 fn yes() -> bool {
@@ -33,7 +37,7 @@ fn yes() -> bool {
 
 impl Default for UpdateConfig {
     fn default() -> Self {
-        Self { check: true }
+        Self { check: true, importer: true }
     }
 }
 
@@ -953,9 +957,12 @@ mod tests {
     #[test]
     fn old_update_settings_still_load() {
         let json = serde_json::to_value(UpdateConfig::default()).unwrap();
-        assert_eq!(json, serde_json::json!({ "check": true }));
+        assert_eq!(json, serde_json::json!({ "check": true, "importer": true }));
         let off: UpdateConfig = serde_json::from_str(r#"{"check":false}"#).unwrap();
-        assert!(!off.check);
+        assert!(!off.check && off.importer);
+        let both: UpdateConfig =
+            serde_json::from_str(r#"{"check":false,"importer":false}"#).unwrap();
+        assert!(!both.check && !both.importer);
         let old = r#"{
             "data_version": 3,
             "updates": { "check": true, "skip": "1.0.7", "checked_at": 1790000000, "latest": "v1.0.7" },
