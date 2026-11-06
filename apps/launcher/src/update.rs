@@ -156,10 +156,10 @@ impl Shell {
 
     fn tick_updates(&mut self, cx: &mut Context<Self>) {
         let now = update::now_secs();
-        let check_launcher = self.store.config().updates.check;
+        let check_updates = self.store.config().updates.check;
         let u = &self.updates;
-        let addon_due = u.addon.probe_due(now);
-        let launcher_due = check_launcher && u.launcher.probe_due(now);
+        let addon_due = check_updates && u.addon.probe_due(now);
+        let launcher_due = check_updates && u.launcher.probe_due(now);
         if u.checking
             || matches!(u.phase, Phase::Installing | Phase::Restarting)
             || !(addon_due || launcher_due)

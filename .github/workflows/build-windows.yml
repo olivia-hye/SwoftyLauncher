@@ -1,0 +1,33 @@
+name: Build Windows binaries
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: true
+
+      - name: Build
+        run: cargo build --release -p swofty-cli -p swofty-launcher
+        env:
+          SWOFTY_LOGS_URL: https://api.f1.swofty.net/v1/logs
+          SWOFTY_USAGE_URL: https://api.f1.swofty.net
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-binaries
+          path: |
+            target/release/swofty.exe
+            target/release/swofty-launcher.exe
+          if-no-files-found: error
+          retention-days: 3
